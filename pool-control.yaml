@@ -1,0 +1,333 @@
+esphome:
+  name: pool-control
+
+substitutions:
+  display_name: Pool Control
+  
+esp32:
+  board: esp-wrover-kit
+  framework:
+    type: arduino
+
+logger:
+
+# Enable Home Assistant API
+api:
+
+ota:
+  platform: esphome
+
+wifi:
+  ssid: "IOT"
+  password: "PASSWORD"
+  fast_connect: true
+  manual_ip:
+    static_ip: 192.168.20.27
+    gateway: 192.168.20.1
+    subnet: 255.255.255.0
+
+captive_portal:
+  
+web_server:
+  port: 80
+
+# configuration
+
+globals:
+  - id: heater_run
+    type: std::string
+    initial_value: '"Idle"'
+  - id: heater_on
+    type: std::string
+    initial_value: '"Off"'  
+  - id: Pump_Status
+    type: std::string
+    initial_value: '"Low"'
+
+i2c:
+  sda: GPIO22
+  scl: GPIO23
+display:
+  - platform: lcd_pcf8574
+    dimensions: 20x4
+    address: 0x27
+    lambda: |-
+          it.printf(0, 0, "Water: %.0fF Air: %.0fF", id(d_temp_in).state, id(d_ambient).state);
+          it.printf(0, 1, "Heater %s %s", id(heater_on).c_str(), id(heater_run).c_str());
+          it.printf(0, 2, "Heat to: %.0fF", id(d_heat_temp).state);
+          it.printf(0, 3, "Pump Speed: %s", id(Pump_Status).c_str());  
+
+one_wire:
+  - platform: gpio
+    pin: GPIO04  # Replace with your actual GPIO pin
+    id: bus1
+  - platform: gpio
+    pin: GPIO14  # Replace with your actual GPIO pin
+    id: bus2
+  - platform: gpio
+    pin: GPIO15  # Replace with your actual GPIO pin
+    id: bus3
+sensor:
+  - platform: dallas_temp
+    address:  0x64406c0087ca0528
+    one_wire_id: bus1
+    id: temp_in
+    update_interval: 5s # Adjust as needed
+  - platform: dallas_temp
+    address:  0x7914d40087856c28
+    one_wire_id: bus2
+    id: temp_out
+    update_interval: 10s # Adjust as needed
+  - platform: dallas_temp
+    address: 0x6a385c00874f0528
+    one_wire_id: bus3
+    id: ambient
+    update_interval: 10s
+  
+
+  - platform: template
+    name: "Temperature In"
+    id: d_temp_in
+    unit_of_measurement: "°F"
+    accuracy_decimals: 0
+    lambda: |-
+      return round((id(temp_in).state) * (9.0 / 5.0) + 32.0);
+    update_interval: 5s
+  - platform: template
+    name: "Temperature out"
+    id: d_temp_out
+    unit_of_measurement: "°F"
+    accuracy_decimals: 0
+    lambda: |-
+      return round((id(temp_out).state) * (9.0 / 5.0) + 32.0);
+    update_interval: 10s  
+  - platform: template
+    name: "Ambient Temp"
+    id: d_ambient
+    unit_of_measurement: "°F"
+    accuracy_decimals: 0
+    lambda: |-
+      return round((id(ambient).state) * (9.0 / 5.0) + 32.0);
+    update_interval: 10s        
+  - platform: template
+    name: "Heater Set Point"
+    id: d_heat_temp
+    unit_of_measurement: "°F"
+    accuracy_decimals: 0
+    lambda: |-
+      { return round((id(pool_heater).target_temperature) * (9.0/5.0) + 32.0);
+            }
+    update_interval: 2s  
+
+text_sensor:
+  - platform: template
+    name: HA Pump Status  
+    lambda:  |-
+       return { id(Pump_Status) };
+    update_interval: 1s
+
+binary_sensor:
+  - platform: gpio
+    id: p_off
+    pin: GPIO34
+    on_click:
+    - min_length: 50ms
+      max_length: 350ms
+      then:
+        - button.press: b_off
+  - platform: gpio
+    id: p_low
+    pin: GPIO35
+    on_click:
+    - min_length: 50ms
+      max_length: 350ms
+      then:
+        - button.press: b_low
+  #- platform: gpio
+  #  id: p_med
+  #  pin: GPIO336
+  #  on_click:
+  #  - min_length: 50ms
+  #    max_length: 350ms
+  #    then:
+  #      - button.press: b_med
+  - platform: gpio
+    id: p_high
+    pin: GPIO39
+    on_click:
+    - min_length: 50ms
+      max_length: 350ms
+      then:
+        - button.press: b_high
+  - platform: gpio
+    id: t_heat
+    pin: GPIO12
+    on_click:
+    - min_length: 50ms
+      max_length: 350ms
+      then:
+        - button.press: b_heat
+     
+  - platform: gpio
+    id: t_up
+    pin: GPIO32 
+    on_click:
+    - min_length: 50ms
+      max_length: 350ms
+      then:
+        - button.press: b_t_up
+
+  - platform: gpio
+    id: t_down
+    pin: GPIO33 
+    on_click:
+    - min_length: 50ms
+      max_length: 350ms
+      then:
+        - button.press: b_t_down
+
+switch:
+  - platform: gpio
+    pin: GPIO21
+    id: speed_low
+    interlock: &interlock_group [speed_low, speed_high] #for 3 speed [speed_low, speed_med, speed_high]
+    interlock_wait_time: 1s
+    
+# - platform: gpio
+#    pin: GPIO19
+#    id: speed_med
+#    inverted: true
+#    interlock: *interlock_group
+#    interlock_wait_time: 1s
+  - platform: gpio
+    pin: GPIO18
+    id: speed_high
+    interlock: *interlock_group
+    interlock_wait_time: 1s
+  - platform: gpio
+    pin: GPIO05
+    id: relay_4
+
+
+button:
+  - platform: template
+    name: "Pump Off"
+    id: b_off
+    on_press:
+      then:
+        - climate.control:
+            id: pool_heater
+            mode: "OFF"
+        - switch.turn_off: speed_low
+#        - switch.turn_off: speed_med  
+        - switch.turn_off: speed_high
+        - globals.set:
+            id: Pump_Status
+            value: '"Off"'
+  - platform: template
+    name: "Pump Low"
+    id: b_low
+    on_press:
+      then:
+        - switch.turn_on: speed_low
+        - globals.set:
+            id: Pump_Status
+            value: '"Low"'
+  #- platform: template
+  #  name: "Pump Med"
+  #  id: b_med
+  #  on_press:
+  #   then:
+  #     - switch.turn_on: speed_med
+  #     - globals.set:
+  #         id: Pump_Status
+  #         value: "Medium"
+  - platform: template
+    name: "Pump High"
+    id: b_high
+    on_press:
+      then:
+        - switch.turn_on: speed_high
+        - globals.set:
+            id: Pump_Status
+            value: '"High"'
+  - platform: template
+    name: "Heater"
+    id: b_heat 
+    on_press:
+      - lambda: !lambda |-
+          if (id(pool_heater).mode == CLIMATE_MODE_HEAT) {
+            id(pool_heater).mode = CLIMATE_MODE_OFF;
+
+          } else {
+            id(pool_heater).mode = CLIMATE_MODE_HEAT;
+          }
+          id(pool_heater).publish_state();
+  - platform: template
+    name: "Increase Temperature"
+    id: b_t_up
+    on_press:
+      then:
+        - lambda: !lambda |-
+            id(pool_heater).target_temperature += .55;
+            ESP_LOGD("main", "Increased target temperature to %f", id(pool_heater).target_temperature);
+  - platform: template
+    name: "Decrease Temperature"
+    id: b_t_down
+    on_press:
+      then:
+        - lambda: !lambda |-
+            id(pool_heater).target_temperature -= .55; 
+            ESP_LOGD("main", "Decreased target temperature to %f", id(pool_heater).target_temperature);
+      
+  
+# heater control
+
+climate:
+  - platform: thermostat
+    visual:
+      min_temperature: 50 °F
+      max_temperature: 100 °F
+      temperature_step: 1 °F
+    name: "Thermostat"
+    id: pool_heater
+    default_preset: start
+    on_boot_restore_from: DEFAULT_PRESET
+    on_state:
+      - lambda: !lambda |-
+          if (id(pool_heater).mode == CLIMATE_MODE_HEAT) {
+            id(heater_on) = "On";
+          } else {
+            id(heater_on) = "OFF";
+            id(relay_4).turn_off();
+          }
+ 
+    sensor: temp_in
+    min_heating_off_time: 3s #300s
+    min_heating_run_time: 3s #600s
+    min_idle_time: 3s
+    heat_action:
+       - globals.set:
+            id: heater_run
+            value: '"Heat"'
+       - globals.set:
+            id: Pump_Status
+            value: '"High"'
+       - switch.turn_on: speed_high
+       - delay: 5s
+       - switch.turn_on: relay_4
+    idle_action:
+       - switch.turn_off: relay_4
+       - delay: 5s
+       - switch.turn_on: speed_low
+       - globals.set:
+            id: heater_run
+            value: '"Idle"'
+       - globals.set:
+            id: Pump_Status
+            value: '"Low"'
+    heat_deadband: 2 °F
+    preset:
+      - name: start
+        default_target_temperature_low: 70 °F
+        mode: "Off"
