@@ -43,6 +43,34 @@ globals:
   - id: Pump_Status
     type: std::string
     initial_value: '"Low"'
+  - id: Prev_Pump_Status
+    type: std::string
+    initial_value: '"Low"'
+
+time:
+  - platform: sntp
+    id: pool_time
+    timezone: "America/New_York"
+
+interval:
+  - interval: 60s
+    then:
+      - lambda: |-
+          auto now = id(pool_time).now();
+          int hour = now.hour;
+          int min = now.minute;
+
+          // Check schedule
+          if (hour == (int)id(pump_morning_hour).state && min == (int)id(pump_morning_minute).state) {
+            id(Prev_Pump_Status) = "High";
+            if (id(heater_run) == "Idle") id(b_high).press();
+          } else if (hour == (int)id(pump_afternoon_hour).state && min == (int)id(pump_afternoon_minute).state) {
+            id(Prev_Pump_Status) = "Low";
+            if (id(heater_run) == "Idle") id(b_low).press();
+          } else if (hour == (int)id(pump_night_hour).state && min == (int)id(pump_night_minute).state) {
+            id(Prev_Pump_Status) = "Off";
+            if (id(heater_run) == "Idle") id(b_off).press();
+          }
 
 i2c:
   sda: GPIO22
@@ -52,10 +80,30 @@ display:
     dimensions: 20x4
     address: 0x27
     lambda: |-
-          it.printf(0, 0, "Water: %.0fF Air: %.0fF", id(d_temp_in).state, id(d_ambient).state);
-          it.printf(0, 1, "Heater %s %s", id(heater_on).c_str(), id(heater_run).c_str());
-          it.printf(0, 2, "Heat to: %.0fF", id(d_heat_temp).state);
-          it.printf(0, 3, "Pump Speed: %s", id(Pump_Status).c_str());  
+      // Convert temps
+      float water = id(d_temp_in).state;
+      float air = id(d_ambient).state;
+      float setpoint = id(d_heat_temp).state;
+
+      // Print line 1: Temperatures
+      it.printf(0, 0, "Water: %.0fF  Air: %.0fF", water, air);
+
+      // Print line 2: Heater Status
+      if (id(heater_on) == "On") {
+        if (id(heater_run) == "Heat") {
+          it.printf(0, 1, "Heater: On  Heating");
+        } else {
+          it.printf(0, 1, "Heater: On  Idle   ");
+        }
+      } else {
+        it.printf(0, 1, "Heater: Off          ");
+      }
+
+      // Print line 3: Heat target
+      it.printf(0, 2, "Set Temp: %.0fF", setpoint);
+
+      // Print line 4: Pump status
+      it.printf(0, 3, "Pump Speed: %s", id(Pump_Status).c_str());
 
 one_wire:
   - platform: gpio
@@ -67,7 +115,32 @@ one_wire:
   - platform: gpio
     pin: GPIO15  # Replace with your actual GPIO pin
     id: bus3
+
+
+
 sensor:
+  - platform: homeassistant
+    entity_id: input_number.pump_morning_hour
+    id: pump_morning_hour
+  - platform: homeassistant
+    entity_id: input_number.pump_morning_minute
+    id: pump_morning_minute
+
+  - platform: homeassistant
+    entity_id: input_number.pump_afternoon_hour
+    id: pump_afternoon_hour
+  - platform: homeassistant
+    entity_id: input_number.pump_afternoon_minute
+    id: pump_afternoon_minute
+
+  - platform: homeassistant
+    entity_id: input_number.pump_night_hour
+    id: pump_night_hour
+  - platform: homeassistant
+    entity_id: input_number.pump_night_minute
+    id: pump_night_minute
+  
+  
   - platform: dallas_temp
     address:  0x64406c0087ca0528
     one_wire_id: bus1
@@ -193,12 +266,12 @@ switch:
     interlock: &interlock_group [speed_low, speed_high] #for 3 speed [speed_low, speed_med, speed_high]
     interlock_wait_time: 1s
     
-# - platform: gpio
-#    pin: GPIO19
-#    id: speed_med
-#    inverted: true
-#    interlock: *interlock_group
-#    interlock_wait_time: 1s
+  - platform: gpio
+    pin: GPIO19
+    id: speed_med
+    inverted: true
+    interlock: *interlock_group
+    interlock_wait_time: 1s
   - platform: gpio
     pin: GPIO18
     id: speed_high
@@ -219,11 +292,15 @@ button:
             id: pool_heater
             mode: "OFF"
         - switch.turn_off: speed_low
-#        - switch.turn_off: speed_med  
+#        - switch.turn_off: speed_med
         - switch.turn_off: speed_high
         - globals.set:
             id: Pump_Status
             value: '"Off"'
+        - globals.set:
+            id: Prev_Pump_Status
+            value: '"Off"'
+
   - platform: template
     name: "Pump Low"
     id: b_low
@@ -233,15 +310,22 @@ button:
         - globals.set:
             id: Pump_Status
             value: '"Low"'
-  #- platform: template
-  #  name: "Pump Med"
-  #  id: b_med
-  #  on_press:
-  #   then:
-  #     - switch.turn_on: speed_med
-  #     - globals.set:
-  #         id: Pump_Status
-  #         value: "Medium"
+        - globals.set:
+            id: Prev_Pump_Status
+            value: '"Low"'
+#  - platform: template
+#    name: "Pump Med"
+#    id: b_med
+#    on_press:
+#      then:
+#        - switch.turn_on: speed_med
+#        - globals.set:
+#            id: Pump_Status
+#            value: '"Med"'
+#        - globals.set:
+#            id: Prev_Pump_Status
+#            value: '"Med"'          
+
   - platform: template
     name: "Pump High"
     id: b_high
@@ -250,6 +334,9 @@ button:
         - switch.turn_on: speed_high
         - globals.set:
             id: Pump_Status
+            value: '"High"'
+        - globals.set:
+            id: Prev_Pump_Status
             value: '"High"'
   - platform: template
     name: "Heater"
@@ -293,39 +380,50 @@ climate:
     id: pool_heater
     default_preset: start
     on_boot_restore_from: DEFAULT_PRESET
+
     on_state:
-      - lambda: !lambda |-
+      - lambda: |-
           if (id(pool_heater).mode == CLIMATE_MODE_HEAT) {
             id(heater_on) = "On";
           } else {
-            id(heater_on) = "OFF";
+            id(heater_on) = "Off";
             id(relay_4).turn_off();
           }
- 
+
     sensor: temp_in
-    min_heating_off_time: 3s #300s
-    min_heating_run_time: 3s #600s
+    min_heating_off_time: 3s
+    min_heating_run_time: 3s
     min_idle_time: 3s
+
     heat_action:
-       - globals.set:
-            id: heater_run
-            value: '"Heat"'
-       - globals.set:
-            id: Pump_Status
-            value: '"High"'
-       - switch.turn_on: speed_high
-       - delay: 5s
-       - switch.turn_on: relay_4
+      - lambda: |-
+          // Remember current pump state before forcing High
+          id(Prev_Pump_Status) = id(Pump_Status);
+      - globals.set:
+          id: heater_run
+          value: '"Heat"'
+      - globals.set:
+          id: Pump_Status
+          value: '"High"'
+      - switch.turn_on: speed_high
+      - delay: 5s
+      - switch.turn_on: relay_4
+
     idle_action:
-       - switch.turn_off: relay_4
-       - delay: 5s
-       - switch.turn_on: speed_low
-       - globals.set:
-            id: heater_run
-            value: '"Idle"'
-       - globals.set:
-            id: Pump_Status
-            value: '"Low"'
+      - switch.turn_off: relay_4          # turn off heater relay
+      - delay: 5s
+      - lambda: |-
+          // Restore pump to previously scheduled state
+          if (id(Prev_Pump_Status) == "Low") {
+          id(b_low).press();
+          } else if (id(Prev_Pump_Status) == "High") {
+          id(b_high).press();
+          } else if (id(Prev_Pump_Status) == "Off") {
+          id(b_off).press();
+          }
+          id(heater_run) = "Idle";
+          ESP_LOGI("heater", "Idle - Pump restored to scheduled state: %s", id(Prev_Pump_Status).c_str());
+
     heat_deadband: 2 °F
     preset:
       - name: start
