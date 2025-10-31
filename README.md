@@ -1,4 +1,4 @@
-Welcome to yet another Pool-automation wiki!
+Welcome to yet another Pool-automation
 I have no clue what im doing so any input is welcome.  I'm using a Lilygo T relay with a 4 x 20 LCD, 3 Dallas temp sensors and a few other components ill post as I go along.  Im basically making Dumb pool equipment less dumb.  My goal is to have every smart device run locally with Home assistant being the bridge.  If for any reason HA goes down the device will continue to operate independently. 
 ![514CT8gaWgL _AC_SL1000_](https://github.com/user-attachments/assets/6623c8d6-98ed-4d80-a219-f4608857c9cc)
 
