@@ -10,6 +10,8 @@ The heater will be controlled via the external contact with the t relay acting a
 
 Pump control is for any pump with dry contacts. The pump I am currently controlling is a generic 2 speed pump.  The low and high relay are tied to 25A SSRs that are wired to the low and high terminals separately.  Lockout to prevent both SS relays closing at once is via an interlock group and the common of each Lilygo relay is tied to the NC of the prior.
 
-I plan to control an Aqua Rite SWCG as well but im just digging into that now.
+The rs-485 protocol fopr the AquaRite ia outlines on nodeJS pool control.  I was able to put it all in YAML and it seems to be working.  I am going to add a rj45 into the 485 bus for debugging, I may incorporate a CYD to display and set all the data locally since the entire thing runs independent of Home Assistant, but my end goal is to mave everytthing in my house on Home assistant.
+
+Im sure there are improvements to make but for my first project its not to shabby.  
  
 
