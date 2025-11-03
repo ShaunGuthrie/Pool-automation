@@ -33,6 +33,27 @@ captive_portal:
 web_server:
   port: 80
 
+# as of 11/3/2025
+# uart 59
+# Globals 73
+# time 100
+# interval 104
+# display 274
+# one wire 327
+# sensor 333
+# number 455
+# text sensor 524
+# binary sensor 564
+# switch 641
+# button 754
+# climate 840
+
+
+
+
+
+
+
 
 
 # configuration
@@ -69,6 +90,10 @@ globals:
     type: int
     restore_value: no
     initial_value: '0'
+  - id: current_screen
+    type: int
+    restore_value: yes
+    initial_value: '0'  
   
 
 
@@ -137,6 +162,9 @@ interval:
             // Decode known codes
             std::string status_str = "Unknown";
             switch (combined) {
+              case 0x0000:
+                status_str = "Low Flow";
+                break;
               case 0x0001:
                 status_str = "System OK";
                 break;
@@ -252,39 +280,52 @@ i2c:
   scl: GPIO23
 display:
   - platform: lcd_pcf8574
+    id: my_lcd
     dimensions: 20x4
-    update_interval: 1s
+    update_interval: 200ms
     address: 0x27
     lambda: |-
       float water = id(d_temp_in).state;
       float air = id(d_ambient).state;
       float setpoint = id(d_heat_temp).state;
+      float salt = id(salt_ppm).state;
+      float genout = id(chlor_output_target).state;
 
-      // Line 1: Temps
-      it.printf(0, 0, "Water: %.0fF  Air: %.0fF", water, air);
+      // Screen 0 - Main Status
+      if (id(current_screen) == 0) {
+        it.printf(0, 0, "Water: %.0fF  Air: %.0fF", water, air);
 
-      // Line 2: Heater Status
-      if (id(heater_on) == "On") {
-        if (id(heater_run) == "Heat") {
-          it.printf(0, 1, "Heater: On  Heating");
+        if (id(heater_on) == "On") {
+          if (id(heater_run) == "Heat") {
+            it.printf(0, 1, "Heater: On  Heating");
+          } else {
+            it.printf(0, 1, "Heater: On  Idle   ");
+          }
         } else {
-          it.printf(0, 1, "Heater: On  Idle   ");
+          it.printf(0, 1, "Heater: Off          ");
         }
-      } else {
-        it.printf(0, 1, "Heater: Off          ");
+
+        it.printf(0, 2, "Set Temp: %.0fF", setpoint);
+        it.printf(0, 3, "Pump: %s Set: %s", id(Pump_Status).c_str(), id(Prev_Pump_Status).c_str());
       }
 
-      // Line 3: Set Temp
-      it.printf(0, 2, "Set Temp: %.0fF", setpoint);
-      
-      it.printf(0, 3, "Pump: %s Set: %s", id(Pump_Status).c_str(), id(Prev_Pump_Status).c_str());
-#      // Line 4: Pump Status & Scheduled
-#      if (id(Manual_Override)) {
-#        it.printf(0, 3, "Pump: %s  Override", id(Pump_Status).c_str());
-#      } else {
-#        it.printf(0, 3, "Pump: %s  Sched: %s", 
-#                  id(Pump_Status).c_str(), id(Prev_Pump_Status).c_str());
-#      }
+      // Screen 1 - Network Info
+      else if (id(current_screen) == 1) {
+        it.printf(0, 0, "Salt %.0f PPM", salt);
+        it.printf(0, 1, "Desired Output %.0f%", genout);
+        it.printf(0, 2, "Status: %s", id(chlor_status_text).state.c_str());
+        it.printf(0, 3, "%s", id(chlor_error_text).state.c_str());
+      }
+
+      // Screen 2 - System Info
+      else if (id(current_screen) == 2) {
+        it.printf(0, 0, "nothing");
+        it.printf(0, 1, "to");
+        it.printf(0, 2, "see");
+        it.printf(0, 3, "here");
+      }
+
+
      
 
 # One-wire temp sensors
@@ -580,6 +621,14 @@ binary_sensor:
         max_length: 350ms
         then:
           - button.press: b_t_down
+  - platform: gpio
+    id: lcd_next
+    pin: GPIO13
+    on_click:
+      - min_length: 50ms
+        max_length: 350ms
+        then:
+          - button.press: b_next        
   - platform: template
     name: "No Flow"
     id: chlor_error_no_flow
@@ -708,6 +757,14 @@ switch:
 
 # Pump & Heater Buttons
 button:
+  - platform: template
+    name: "Next LCD Screen"
+    id: b_next
+    on_press:
+      - lambda: !lambda |-
+          id(current_screen)++;
+          if (id(current_screen) > 2) id(current_screen) = 0;  // wrap back to 0
+          id(my_lcd).update();
   - platform: template
     name: "Pump Off"
     id: b_off
