@@ -1,4 +1,5 @@
-Welcome to yet another Pool-automation
+Welcome to yet another Pool-automation Github.
+
 I have no clue what im doing so any input is welcome.  I'm using a Lilygo T relay with a 4 x 20 LCD, 3 Dallas temp sensors and a few other components ill post as I go along.  Im basically making Dumb pool equipment less dumb.  My goal is to have every smart device run locally with Home assistant being the bridge.  If for any reason HA goes down the device will continue to operate independently. 
 ![514CT8gaWgL _AC_SL1000_](https://github.com/user-attachments/assets/6623c8d6-98ed-4d80-a219-f4608857c9cc)
 
@@ -12,6 +13,6 @@ Pump control is for any pump with dry contacts. The pump I am currently controll
 
 The rs-485 protocol fopr the AquaRite ia outlined on nodeJS pool control.  I was able to put it all in YAML and it seems to be working.  I am going to add a rj45 into the 485 bus for debugging, I may incorporate a CYD to display and set all the data locally since the entire thing runs independent of Home Assistant, but my end goal is to have everytthing in my house on Home assistant.
 
-Im sure there are improvements to make but for my first project its not to shabby.  Unfortunatly my spelling leaves alot to be desired
+Im sure there are improvements to make but for my first project its not to shabby.  
  
 
