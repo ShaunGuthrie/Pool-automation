@@ -10,6 +10,8 @@ esp32:
     type: arduino
 
 logger:
+  level: DEBUG
+  baud_rate: 0  # disable serial logging so UART is free
 
 # Enable Home Assistant API
 api:
@@ -31,7 +33,21 @@ captive_portal:
 web_server:
   port: 80
 
+
+
 # configuration
+uart:
+  id: uart_bus
+  tx_pin: GPIO15
+  rx_pin: GPIO14
+  baud_rate: 9600
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+  rx_buffer_size: 256
+
+
+  
 
 globals:
   - id: heater_run
@@ -46,49 +62,208 @@ globals:
   - id: Prev_Pump_Status
     type: std::string
     initial_value: '"Low"'
+  - id: Manual_Override
+    type: bool
+    initial_value: 'false'
+  - id: super_chlor_remaining
+    type: int
+    restore_value: no
+    initial_value: '0'
+  
+
 
 time:
-  - platform: sntp
+  - platform: homeassistant
     id: pool_time
-    timezone: "America/New_York"
 
 interval:
   - interval: 60s
     then:
       - lambda: |-
-          auto now = id(pool_time).now();
-          int hour = now.hour;
-          int min = now.minute;
+          if (id(super_chlorinate).state && id(super_chlor_remaining) > 0) {
+            id(super_chlor_remaining) -= 60;
+            if (id(super_chlor_remaining) <= 0) {
+              id(super_chlor_remaining) = 0;
+              id(super_chlorinate).turn_off();
+              ESP_LOGI("chlor", "Super Chlorinate auto-off after 6h");
+            }
+          }
+          id(super_chlor_remaining_sensor).update();
 
-          // Check schedule
-          if (hour == (int)id(pump_morning_hour).state && min == (int)id(pump_morning_minute).state) {
-            id(Prev_Pump_Status) = "High";
-            if (id(heater_run) == "Idle") id(b_high).press();
-          } else if (hour == (int)id(pump_afternoon_hour).state && min == (int)id(pump_afternoon_minute).state) {
-            id(Prev_Pump_Status) = "Low";
-            if (id(heater_run) == "Idle") id(b_low).press();
-          } else if (hour == (int)id(pump_night_hour).state && min == (int)id(pump_night_minute).state) {
-            id(Prev_Pump_Status) = "Off";
-            if (id(heater_run) == "Idle") id(b_off).press();
+  - interval: 30s
+    then:
+      - lambda: |-
+          // --- Utility: Clear UART RX buffer ---
+          while (id(uart_bus).available()) {
+            uint8_t dummy;
+            id(uart_bus).read_byte(&dummy);
           }
 
+          // --- Helper function to send, wait, and receive a frame ---
+          auto send_and_receive = [&](const uint8_t *packet, size_t len, const char *label, uint32_t timeout_ms = 600) -> std::vector<uint8_t> {
+            id(uart_bus).write_array(packet, len);
+            ESP_LOGI("chlor", "Sent chlorinator %s request", label);
+            std::vector<uint8_t> rx;
+            uint8_t b;
+            uint32_t start = millis();
+            while (millis() - start < timeout_ms) {
+              if (id(uart_bus).available() && id(uart_bus).read_byte(&b)) {
+                rx.push_back(b);
+                ESP_LOGD("chlor", "[%s] RX byte: 0x%02X", label, b);
+              } else {
+                delay(5);
+              }
+            }
+            ESP_LOGI("chlor", "[%s] RX %d bytes", label, rx.size());
+            if (!rx.empty()) {
+              ESP_LOGI("chlor", "[%s] RAW: %s", label, format_hex_pretty(rx).c_str());
+            } else {
+              ESP_LOGW("chlor", "[%s] No response", label);
+            }
+            return rx;
+          };
+
+          // --- STATUS Request ---
+          static const uint8_t req_status[] = {0x10, 0x02, 0x50, 0x00, 0x00, 0x62, 0x10, 0x03};
+          auto rx_status = send_and_receive(req_status, sizeof(req_status), "STATUS");
+          if (rx_status.size() >= 9) {
+            uint8_t cmd = rx_status[3];
+            uint8_t d1  = rx_status[4];
+            uint8_t d2  = rx_status[5];
+            uint16_t combined = ((uint16_t)d1 << 8) | d2;
+
+            id(chlor_status).publish_state(combined);
+
+            // Decode known codes
+            std::string status_str = "Unknown";
+            switch (combined) {
+              case 0x0001:
+                status_str = "System OK";
+                break;
+              // add more as you identify them...
+            }
+
+            id(chlor_status_text).publish_state(status_str.c_str());
+
+            ESP_LOGI("chlor", "STATUS=0x%04X (%s)", combined, status_str.c_str());
+          }
+
+          delay(500);  // Small pause between requests
+
+          // --- SALT Request ---
+          static const uint8_t req_salt[] = {0x10, 0x02, 0x50, 0x11, 0x00, 0x73, 0x10, 0x03};
+          auto rx_salt = send_and_receive(req_salt, sizeof(req_salt), "SALT");
+          if (rx_salt.size() >= 11) {
+            uint8_t salt_raw = rx_salt[4];
+            float ppm = salt_raw * 50.0f;
+            id(salt_ppm).publish_state(ppm);
+            
+             uint8_t output_percent_raw = rx_salt[3];
+             if (output_percent_raw <= 100) {
+              id(chlor_output_percent).publish_state(output_percent_raw);
+              ESP_LOGI("chlor", "Output: %u%%", output_percent_raw);
+            }
+            
+            uint8_t error = rx_salt[5];
+            id(chlor_error_code).publish_state(error);
+
+            bool no_flow  = error & 0x01;
+            bool low_salt = error & 0x02;
+            bool high_salt = error & 0x04;
+            bool clean_cell = error & 0x90;
+
+            id(chlor_error_no_flow).publish_state(no_flow);
+            id(chlor_error_low_salt).publish_state(low_salt);
+            id(chlor_error_high_salt).publish_state(high_salt);
+            id(chlor_error_clean_cell).publish_state(clean_cell);
+
+            std::string errtxt = "OK";
+            if (error != 0x00) {
+              errtxt.clear();
+              if (no_flow) errtxt += "No Flow ";
+              if (low_salt) errtxt += "Low Salt ";
+              if (high_salt) errtxt += "High Salt ";
+              if (clean_cell) errtxt += "Clean Cell ";
+              if (errtxt.empty()) errtxt = "Unknown";
+            }
+            id(chlor_error_text).publish_state(errtxt.c_str());
+
+            ESP_LOGI("chlor", "SALT: %.0f ppm, ERR=0x%02X (%s)", ppm, error, errtxt.c_str());
+          }
+  - interval: 30s
+    then:
+      - lambda: |-
+          auto now = id(pool_time).now();
+          if (!now.is_valid()) return;
+          int current = now.hour*3600 + now.minute*60 + now.second;
+
+          // Parse scheduled times
+          int pool1_h, pool1_m, pool1_s;
+          if (sscanf(id(pool_1).state.c_str(), "%d:%d:%d", &pool1_h, &pool1_m, &pool1_s) != 3)
+            pool1_h = pool1_m = pool1_s = 0;
+          int pool1_time = pool1_h*3600 + pool1_m*60 + pool1_s;
+
+          int pool2_h, pool2_m, pool2_s;
+          if (sscanf(id(pool_2).state.c_str(), "%d:%d:%d", &pool2_h, &pool2_m, &pool2_s) != 3)
+            pool2_h = pool2_m = pool2_s = 0;
+          int pool2_time = pool2_h*3600 + pool2_m*60 + pool2_s;
+
+          int pool3_h, pool3_m, pool3_s;
+          if (sscanf(id(pool_3).state.c_str(), "%d:%d:%d", &pool3_h, &pool3_m, &pool3_s) != 3)
+            pool3_h = pool3_m = pool3_s = 0;
+          int pool3_time = pool3_h*3600 + pool3_m*60 + pool3_s;
+
+          // Numeric speeds
+          int speed1 = id(pool_1_speed_numeric).state;
+          int speed2 = id(pool_2_speed_numeric).state;
+          int speed3 = id(pool_3_speed_numeric).state;
+
+          struct Schedule { int time_sec; int speed; };
+          Schedule schedules[3] = {
+            { pool1_time, speed1 },
+            { pool2_time, speed2 },
+            { pool3_time, speed3 }
+          };
+
+          // Loop through schedules
+          for (auto &s : schedules) {
+            if (abs(current - s.time_sec) < 30) {  // within 30s of schedule
+              
+              if (id(heater_run) == "Heat") {
+                // Heater is running: store scheduled speed for later
+                if (s.speed == 0) id(Prev_Pump_Status) = "Off";
+                else if (s.speed == 1) id(Prev_Pump_Status) = "Low";
+                else if (s.speed == 2) id(Prev_Pump_Status) = "Medium";
+                else if (s.speed == 3) id(Prev_Pump_Status) = "High";
+                continue;  // skip applying buttons
+              }
+
+              // Apply scheduled speed if heater not running
+              if (s.speed == 0) id(b_off).press();
+              else if (s.speed == 1) id(b_low).press();
+              else if (s.speed == 3) id(b_high).press();
+            }
+          }
+
+
+# Display
 i2c:
   sda: GPIO22
   scl: GPIO23
 display:
   - platform: lcd_pcf8574
     dimensions: 20x4
+    update_interval: 1s
     address: 0x27
     lambda: |-
-      // Convert temps
       float water = id(d_temp_in).state;
       float air = id(d_ambient).state;
       float setpoint = id(d_heat_temp).state;
 
-      // Print line 1: Temperatures
+      // Line 1: Temps
       it.printf(0, 0, "Water: %.0fF  Air: %.0fF", water, air);
 
-      // Print line 2: Heater Status
+      // Line 2: Heater Status
       if (id(heater_on) == "On") {
         if (id(heater_run) == "Heat") {
           it.printf(0, 1, "Heater: On  Heating");
@@ -99,65 +274,47 @@ display:
         it.printf(0, 1, "Heater: Off          ");
       }
 
-      // Print line 3: Heat target
+      // Line 3: Set Temp
       it.printf(0, 2, "Set Temp: %.0fF", setpoint);
+      
+      it.printf(0, 3, "Pump: %s Set: %s", id(Pump_Status).c_str(), id(Prev_Pump_Status).c_str());
+#      // Line 4: Pump Status & Scheduled
+#      if (id(Manual_Override)) {
+#        it.printf(0, 3, "Pump: %s  Override", id(Pump_Status).c_str());
+#      } else {
+#        it.printf(0, 3, "Pump: %s  Sched: %s", 
+#                  id(Pump_Status).c_str(), id(Prev_Pump_Status).c_str());
+#      }
+     
 
-      // Print line 4: Pump status
-      it.printf(0, 3, "Pump Speed: %s", id(Pump_Status).c_str());
-
+# One-wire temp sensors
 one_wire:
   - platform: gpio
-    pin: GPIO04  # Replace with your actual GPIO pin
+    pin: GPIO04
     id: bus1
-  - platform: gpio
-    pin: GPIO14  # Replace with your actual GPIO pin
-    id: bus2
-  - platform: gpio
-    pin: GPIO15  # Replace with your actual GPIO pin
-    id: bus3
-
 
 
 sensor:
-  - platform: homeassistant
-    entity_id: input_number.pump_morning_hour
-    id: pump_morning_hour
-  - platform: homeassistant
-    entity_id: input_number.pump_morning_minute
-    id: pump_morning_minute
 
-  - platform: homeassistant
-    entity_id: input_number.pump_afternoon_hour
-    id: pump_afternoon_hour
-  - platform: homeassistant
-    entity_id: input_number.pump_afternoon_minute
-    id: pump_afternoon_minute
-
-  - platform: homeassistant
-    entity_id: input_number.pump_night_hour
-    id: pump_night_hour
-  - platform: homeassistant
-    entity_id: input_number.pump_night_minute
-    id: pump_night_minute
   
-  
+  # Temp sensors
   - platform: dallas_temp
-    address:  0x64406c0087ca0528
+    address: 0x64406c0087ca0528
     one_wire_id: bus1
     id: temp_in
-    update_interval: 5s # Adjust as needed
+    update_interval: 5s
   - platform: dallas_temp
-    address:  0x7914d40087856c28
-    one_wire_id: bus2
+    address: 0x7914d40087856c28
+    one_wire_id: bus1
     id: temp_out
-    update_interval: 10s # Adjust as needed
+    update_interval: 10s
   - platform: dallas_temp
     address: 0x6a385c00874f0528
-    one_wire_id: bus3
+    one_wire_id: bus1
     id: ambient
     update_interval: 10s
-  
 
+  # Templates
   - platform: template
     name: "Temperature In"
     id: d_temp_in
@@ -167,13 +324,13 @@ sensor:
       return round((id(temp_in).state) * (9.0 / 5.0) + 32.0);
     update_interval: 5s
   - platform: template
-    name: "Temperature out"
+    name: "Temperature Out"
     id: d_temp_out
     unit_of_measurement: "°F"
     accuracy_decimals: 0
     lambda: |-
       return round((id(temp_out).state) * (9.0 / 5.0) + 32.0);
-    update_interval: 10s  
+    update_interval: 10s
   - platform: template
     name: "Ambient Temp"
     id: d_ambient
@@ -181,95 +338,363 @@ sensor:
     accuracy_decimals: 0
     lambda: |-
       return round((id(ambient).state) * (9.0 / 5.0) + 32.0);
-    update_interval: 10s        
+    update_interval: 10s
   - platform: template
     name: "Heater Set Point"
     id: d_heat_temp
     unit_of_measurement: "°F"
     accuracy_decimals: 0
     lambda: |-
-      { return round((id(pool_heater).target_temperature) * (9.0/5.0) + 32.0);
+      return round((id(pool_heater).target_temperature) * (9.0/5.0) + 32.0);
+    update_interval: 2s
+  - platform: template
+    name: "Pool 1 Speed Numeric"
+    id: pool_1_speed_numeric
+    lambda: |-
+      if (id(pool_1_speed).state == "Off") return 0;
+      if (id(pool_1_speed).state == "Low") return 1;
+      if (id(pool_1_speed).state == "Medium") return 2;
+      if (id(pool_1_speed).state == "High") return 3;
+      return 0;
+    update_interval: 1s
+  - platform: template
+    name: "Pool 2 Speed Numeric"
+    id: pool_2_speed_numeric
+    lambda: |-
+      if (id(pool_2_speed).state == "Off") return 0;
+      if (id(pool_2_speed).state == "Low") return 1;
+      if (id(pool_2_speed).state == "Medium") return 2;
+      if (id(pool_2_speed).state == "High") return 3;
+      return 0;
+    update_interval: 1s
+  - platform: template
+    name: "Pool 3 Speed Numeric"
+    id: pool_3_speed_numeric
+    lambda: |-
+      if (id(pool_3_speed).state == "Off") return 0;
+      if (id(pool_3_speed).state == "Low") return 1;
+      if (id(pool_3_speed).state == "Medium") return 2;
+      if (id(pool_3_speed).state == "High") return 3;
+      return 0;
+    update_interval: 1s
+  - platform: template
+    name: "Chlorinator Salt PPM"
+    id: salt_ppm
+    unit_of_measurement: "ppm"
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    name: "Chlorinator Status Code"
+    id: chlor_status
+    accuracy_decimals: 0
+    update_interval: never
+  
+  - platform: template
+    name: "Super Chlorinate Remaining (min)"
+    id: super_chlor_remaining_sensor
+    unit_of_measurement: "min"
+    update_interval: 60s
+    lambda: |-
+      return id(super_chlor_remaining) / 60.0;
+
+  - platform: template
+    name: "Chlorinator Output %"
+    id: chlor_output_actual
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+
+  - platform: template
+    name: "Chlorinator Error Code"
+    id: chlor_error_code
+    accuracy_decimals: 0
+
+  - platform: template
+    name: "Chlorinator Current Output %"
+    id: chlor_output_percent
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    icon: mdi:percent  
+
+number:
+  - platform: template
+    name: "Chlorinator Output %"
+    id: chlor_output_target
+    min_value: 0
+    max_value: 100
+    step: 1
+    optimistic: true
+    on_value:
+      then:
+        - lambda: |-
+            uint8_t output = (uint8_t)x;  // value from HA
+
+            // --- Build packet ---
+            uint8_t packet[8];
+            packet[0] = 0x10;
+            packet[1] = 0x02;
+            packet[2] = 0x50;   // to chlorinator
+            packet[3] = 0x11;   // command = set output %
+            packet[4] = output; // % value
+            uint8_t checksum = (packet[0] + packet[1] + packet[2] + packet[3] + packet[4]) % 256;
+            packet[5] = checksum;
+            packet[6] = 0x10;
+            packet[7] = 0x03;
+
+            // --- Send ---
+            id(uart_bus).write_array(packet, sizeof(packet));
+            ESP_LOGI("chlor", "Sent Set Output %% = %d (checksum=0x%02X)", output, checksum);
+
+            // --- Read reply (if any) ---
+            std::vector<uint8_t> rx;
+            uint32_t start = millis();
+            while (millis() - start < 500) {
+              if (id(uart_bus).available()) {
+                uint8_t b;
+                id(uart_bus).read_byte(&b);
+                rx.push_back(b);
+                ESP_LOGD("chlor", "RX byte: 0x%02X", b);
+              } else {
+                delay(5);
+              }
             }
-    update_interval: 2s  
+
+            if (rx.size() >= 9) {
+              ESP_LOGI("chlor", "RX (%d bytes): %s", rx.size(), format_hex_pretty(rx).c_str());
+
+              // --- Decode ---
+              uint8_t cmd  = rx[3];   // should be 0x12 (status reply)
+              uint8_t salt = rx[4];   // salt ppm * 50
+              uint8_t err  = rx[5];   // error flags
+
+              float ppm = salt * 50.0f;
+              ESP_LOGI("chlor", "Reply: CMD=0x%02X  Salt=%u*50=%.0f ppm  Error=0x%02X", cmd, salt, ppm, err);
+
+              // --- Decode error bits ---
+              std::string err_str = "OK";
+              if (err & 0x01) err_str = "No Flow";
+              else if (err & 0x02) err_str = "Low Salt";
+              else if (err & 0x04) err_str = "High Salt";
+              else if (err & 0x90) err_str = "Clean Cell";
+
+              // --- Optionally publish ---
+              id(salt_ppm).publish_state(ppm);
+              id(chlor_status_text).publish_state(err_str.c_str());
+            } else {
+              ESP_LOGW("chlor", "No valid reply to Set Output %% command");
+            }
+
 
 text_sensor:
+  - platform: homeassistant
+    id: pool_1
+    entity_id: input_datetime.pool_1
+  - platform: homeassistant
+    id: pool_2
+    entity_id: input_datetime.pool_2
+  - platform: homeassistant
+    id: pool_3
+    entity_id: input_datetime.pool_3
+  - platform: homeassistant
+    id: pool_1_speed
+    entity_id: input_select.pool_1_speed
+    name: "test"
+  - platform: homeassistant
+    id: pool_2_speed
+    entity_id: input_select.pool_2_speed
+  - platform: homeassistant
+    id: pool_3_speed
+    entity_id: input_select.pool_3_speed
   - platform: template
-    name: HA Pump Status  
-    lambda:  |-
-       return { id(Pump_Status) };
+    name: HA Pump Status
+    lambda: |-
+      return { id(Pump_Status) };
     update_interval: 1s
+  - platform: template
+    name: HA Desired Speed
+    lambda: |-
+      return { id(Prev_Pump_Status) };
+    update_interval: 1s
+  - platform: template
+    name: "Chlorinator Status Text"
+    id: chlor_status_text
+    update_interval: never
+  - platform: template
+    name: "Chlorinator Error Text"
+    id: chlor_error_text  
 
+
+# GPIO physical inputs
 binary_sensor:
   - platform: gpio
     id: p_off
     pin: GPIO34
     on_click:
-    - min_length: 50ms
-      max_length: 350ms
-      then:
-        - button.press: b_off
+      - min_length: 50ms
+        max_length: 350ms
+        then:
+          - lambda: |-
+              id(Manual_Override) = true;
+          - button.press: b_off
   - platform: gpio
     id: p_low
     pin: GPIO35
     on_click:
-    - min_length: 50ms
-      max_length: 350ms
-      then:
-        - button.press: b_low
-  #- platform: gpio
-  #  id: p_med
-  #  pin: GPIO336
-  #  on_click:
-  #  - min_length: 50ms
-  #    max_length: 350ms
-  #    then:
-  #      - button.press: b_med
+      - min_length: 50ms
+        max_length: 350ms
+        then:
+          - lambda: |-
+              id(Manual_Override) = true;
+          - button.press: b_low
   - platform: gpio
     id: p_high
     pin: GPIO39
     on_click:
-    - min_length: 50ms
-      max_length: 350ms
-      then:
-        - button.press: b_high
+      - min_length: 50ms
+        max_length: 350ms
+        then:
+          - lambda: |-
+              id(Manual_Override) = true;
+          - button.press: b_high
   - platform: gpio
     id: t_heat
     pin: GPIO12
     on_click:
-    - min_length: 50ms
-      max_length: 350ms
-      then:
-        - button.press: b_heat
-     
+      - min_length: 50ms
+        max_length: 350ms
+        then:
+          - button.press: b_heat
   - platform: gpio
     id: t_up
-    pin: GPIO32 
+    pin: GPIO32
     on_click:
-    - min_length: 50ms
-      max_length: 350ms
-      then:
-        - button.press: b_t_up
-
+      - min_length: 50ms
+        max_length: 350ms
+        then:
+          - button.press: b_t_up
   - platform: gpio
     id: t_down
-    pin: GPIO33 
+    pin: GPIO33
     on_click:
-    - min_length: 50ms
-      max_length: 350ms
-      then:
-        - button.press: b_t_down
+      - min_length: 50ms
+        max_length: 350ms
+        then:
+          - button.press: b_t_down
+  - platform: template
+    name: "No Flow"
+    id: chlor_error_no_flow
+  - platform: template
+    name: "Low Salt"
+    id: chlor_error_low_salt
+  - platform: template
+    name: "High Salt"
+    id: chlor_error_high_salt
+  - platform: template
+    name: "Clean Cell"
+    id: chlor_error_clean_cell 
 
+# Pump Switches
 switch:
+  - platform: template
+    name: "Super Chlorinate"
+    id: super_chlorinate
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          // Save the current output setting
+          static float last_output = 0.0f;
+          last_output = id(chlor_output_target).state;
+
+          // Send "Super Chlorinate" (101%)
+          uint8_t output = 101;
+          uint8_t packet[8];
+          packet[0] = 0x10;
+          packet[1] = 0x02;
+          packet[2] = 0x50;   // Destination: Chlorinator
+          packet[3] = 0x11;   // Command: Set Output %
+          packet[4] = output;
+          uint8_t checksum = (packet[0] + packet[1] + packet[2] + packet[3] + packet[4]) % 256;
+          packet[5] = checksum;
+          packet[6] = 0x10;
+          packet[7] = 0x03;
+
+          id(uart_bus).write_array(packet, sizeof(packet));
+          ESP_LOGI("chlor", "Super Chlorinate ON: Sent %% = %d (checksum=0x%02X)", output, checksum);
+
+          // --- Wait briefly for response ---
+          std::vector<uint8_t> rx;
+          uint8_t b;
+          uint32_t start = millis();
+          while (millis() - start < 400) {
+            if (id(uart_bus).available() && id(uart_bus).read_byte(&b)) {
+              rx.push_back(b);
+              ESP_LOGD("chlor", "[SuperChlor] RX byte: 0x%02X", b);
+            } else {
+              delay(3);
+            }
+          }
+
+          if (rx.size() >= 9) {
+            ESP_LOGI("chlor", "[SuperChlor] RX (%d bytes): %s", rx.size(), format_hex_pretty(rx).c_str());
+            uint8_t cmd = rx[3];
+            if (cmd == 0x18) {
+              uint8_t salt_raw = rx[4];
+              float ppm = salt_raw * 50.0f;
+              ESP_LOGI("chlor", "[SuperChlor] ACK: Salt %.0f ppm (raw=0x%02X)", ppm, salt_raw);
+            } else {
+              ESP_LOGI("chlor", "[SuperChlor] Response CMD=0x%02X", cmd);
+            }
+          } else {
+            ESP_LOGW("chlor", "[SuperChlor] No response received");
+          }
+      - sensor.template.publish:
+          id: super_chlor_remaining_sensor
+          state: !lambda 'return id(super_chlor_remaining) / 60.0;'    
+      - delay: 21600s
+      - switch.turn_off: super_chlorinate    
+
+    turn_off_action:
+      - lambda: |-
+          id(super_chlor_remaining) = 0;
+          id(super_chlor_remaining_sensor).publish_state(0);
+          // Restore the last slider setting
+          uint8_t output = (uint8_t)id(chlor_output_target).state;
+          uint8_t packet[8];
+          packet[0] = 0x10;
+          packet[1] = 0x02;
+          packet[2] = 0x50;
+          packet[3] = 0x11;
+          packet[4] = output;
+          uint8_t checksum = (packet[0] + packet[1] + packet[2] + packet[3] + packet[4]) % 256;
+          packet[5] = checksum;
+          packet[6] = 0x10;
+          packet[7] = 0x03;
+
+          id(uart_bus).write_array(packet, sizeof(packet));
+          ESP_LOGI("chlor", "Super Chlorinate OFF: Restored %% = %d (checksum=0x%02X)", output, checksum);
+
+          // Wait for ACK
+          std::vector<uint8_t> rx;
+          uint8_t b;
+          uint32_t start = millis();
+          while (millis() - start < 400) {
+            if (id(uart_bus).available() && id(uart_bus).read_byte(&b)) rx.push_back(b);
+            else delay(3);
+          }
+
+          if (rx.size() >= 9) {
+            ESP_LOGI("chlor", "[Restore] RX (%d bytes): %s", rx.size(), format_hex_pretty(rx).c_str());
+          } else {
+            ESP_LOGW("chlor", "[Restore] No ACK received");
+          }
   - platform: gpio
     pin: GPIO21
     id: speed_low
-    interlock: &interlock_group [speed_low, speed_high] #for 3 speed [speed_low, speed_med, speed_high]
+    interlock: &interlock_group [speed_low, speed_high] 
     interlock_wait_time: 1s
-    
   - platform: gpio
     pin: GPIO19
     id: speed_med
-    inverted: true
     interlock: *interlock_group
     interlock_wait_time: 1s
   - platform: gpio
@@ -281,7 +706,7 @@ switch:
     pin: GPIO05
     id: relay_4
 
-
+# Pump & Heater Buttons
 button:
   - platform: template
     name: "Pump Off"
@@ -292,7 +717,6 @@ button:
             id: pool_heater
             mode: "OFF"
         - switch.turn_off: speed_low
-#        - switch.turn_off: speed_med
         - switch.turn_off: speed_high
         - globals.set:
             id: Pump_Status
@@ -300,6 +724,8 @@ button:
         - globals.set:
             id: Prev_Pump_Status
             value: '"Off"'
+        - lambda: |-
+            id(Manual_Override) = true;
 
   - platform: template
     name: "Pump Low"
@@ -313,18 +739,8 @@ button:
         - globals.set:
             id: Prev_Pump_Status
             value: '"Low"'
-#  - platform: template
-#    name: "Pump Med"
-#    id: b_med
-#    on_press:
-#      then:
-#        - switch.turn_on: speed_med
-#        - globals.set:
-#            id: Pump_Status
-#            value: '"Med"'
-#        - globals.set:
-#            id: Prev_Pump_Status
-#            value: '"Med"'          
+        - lambda: |-
+            id(Manual_Override) = true;
 
   - platform: template
     name: "Pump High"
@@ -338,6 +754,9 @@ button:
         - globals.set:
             id: Prev_Pump_Status
             value: '"High"'
+        - lambda: |-
+            id(Manual_Override) = true;
+
   - platform: template
     name: "Heater"
     id: b_heat 
@@ -345,11 +764,11 @@ button:
       - lambda: !lambda |-
           if (id(pool_heater).mode == CLIMATE_MODE_HEAT) {
             id(pool_heater).mode = CLIMATE_MODE_OFF;
-
           } else {
             id(pool_heater).mode = CLIMATE_MODE_HEAT;
           }
           id(pool_heater).publish_state();
+
   - platform: template
     name: "Increase Temperature"
     id: b_t_up
@@ -357,19 +776,15 @@ button:
       then:
         - lambda: !lambda |-
             id(pool_heater).target_temperature += .55;
-            ESP_LOGD("main", "Increased target temperature to %f", id(pool_heater).target_temperature);
   - platform: template
     name: "Decrease Temperature"
     id: b_t_down
     on_press:
       then:
         - lambda: !lambda |-
-            id(pool_heater).target_temperature -= .55; 
-            ESP_LOGD("main", "Decreased target temperature to %f", id(pool_heater).target_temperature);
-      
-  
-# heater control
+            id(pool_heater).target_temperature -= .55;
 
+# Thermostat Control
 climate:
   - platform: thermostat
     visual:
