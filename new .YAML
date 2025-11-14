@@ -1,0 +1,1228 @@
+esphome:
+  name: "pool-display"
+  friendly_name: ESP32-2432S028R Test
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+
+ota:
+  platform: esphome
+
+api:
+
+captive_portal:
+  
+web_server:
+  port: 80
+
+http_request:
+  useragent: esphome/cyd
+  timeout: 10s
+  verify_ssl: False
+
+
+wifi:
+  ssid: "IOT"
+  password: "PASSWORD"
+  fast_connect: true
+  manual_ip:
+    static_ip: 192.168.20.28
+    gateway: 192.168.20.1
+    subnet: 255.255.255.0
+
+i2c:
+  sda: GPIO22
+  scl: GPIO27
+
+ads1115:
+  - address: 0x48
+
+pcf8574:
+  - id: 'ioX'
+    address: 0x26
+    pcf8575: true
+
+xl9535:
+  - id: relays
+    address: 0x20   
+
+uart:
+  id: uart_bus
+  tx_pin: GPIO17
+  rx_pin: GPIO16
+  baud_rate: 9600
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+  rx_buffer_size: 256     
+
+
+time:
+  - platform: homeassistant
+    id: pool_time
+
+interval:
+  - interval: 60s
+    then:
+      - lambda: |-
+          if (id(super_chlorinate).state && id(super_chlor_remaining) > 0) {
+            id(super_chlor_remaining) -= 60;
+            if (id(super_chlor_remaining) <= 0) {
+              id(super_chlor_remaining) = 0;
+              id(super_chlorinate).turn_off();
+              ESP_LOGI("chlor", "Super Chlorinate auto-off after 6h");
+            }
+          }
+          id(super_chlor_remaining_sensor).update();
+
+  - interval: 30s
+    then:
+      - lambda: |-
+          // --- Utility: Clear UART RX buffer ---
+          while (id(uart_bus).available()) {
+            uint8_t dummy;
+            id(uart_bus).read_byte(&dummy);
+          }
+
+          // --- Helper function to send, wait, and receive a frame ---
+          auto send_and_receive = [&](const uint8_t *packet, size_t len, const char *label, uint32_t timeout_ms = 600) -> std::vector<uint8_t> {
+            id(uart_bus).write_array(packet, len);
+            ESP_LOGI("chlor", "Sent chlorinator %s request", label);
+            std::vector<uint8_t> rx;
+            uint8_t b;
+            uint32_t start = millis();
+            while (millis() - start < timeout_ms) {
+              if (id(uart_bus).available() && id(uart_bus).read_byte(&b)) {
+                rx.push_back(b);
+                ESP_LOGD("chlor", "[%s] RX byte: 0x%02X", label, b);
+              } else {
+                delay(5);
+              }
+            }
+            ESP_LOGI("chlor", "[%s] RX %d bytes", label, rx.size());
+            if (!rx.empty()) {
+              ESP_LOGI("chlor", "[%s] RAW: %s", label, format_hex_pretty(rx).c_str());
+            } else {
+              ESP_LOGW("chlor", "[%s] No response", label);
+            }
+            return rx;
+          };
+
+          // --- STATUS Request ---
+          static const uint8_t req_status[] = {0x10, 0x02, 0x50, 0x00, 0x00, 0x62, 0x10, 0x03};
+          auto rx_status = send_and_receive(req_status, sizeof(req_status), "STATUS");
+          if (rx_status.size() >= 9) {
+            uint8_t cmd = rx_status[3];
+            uint8_t d1  = rx_status[4];
+            uint8_t d2  = rx_status[5];
+            uint16_t combined = ((uint16_t)d1 << 8) | d2;
+
+            id(chlor_status).publish_state(combined);
+
+            // Decode known codes
+            std::string status_str = "Unknown";
+            switch (combined) {
+              case 0x0000:
+                status_str = "Low Flow";
+                break;
+              case 0x0001:
+                status_str = "System OK";
+                break;
+              // add more as you identify them...
+            }
+
+            id(chlor_status_text).publish_state(status_str.c_str());
+
+            ESP_LOGI("chlor", "STATUS=0x%04X (%s)", combined, status_str.c_str());
+          }
+
+          delay(500);  // Small pause between requests
+
+          // --- SALT Request ---
+          static const uint8_t req_salt[] = {0x10, 0x02, 0x50, 0x11, 0x00, 0x73, 0x10, 0x03};
+          auto rx_salt = send_and_receive(req_salt, sizeof(req_salt), "SALT");
+          if (rx_salt.size() >= 11) {
+            uint8_t salt_raw = rx_salt[4];
+            float ppm = salt_raw * 50.0f;
+            id(salt_ppm).publish_state(ppm);
+            
+             uint8_t output_percent_raw = rx_salt[3];
+             if (output_percent_raw <= 100) {
+              id(chlor_output_percent).publish_state(output_percent_raw);
+              ESP_LOGI("chlor", "Output: %u%%", output_percent_raw);
+            }
+            
+            uint8_t error = rx_salt[5];
+            id(chlor_error_code).publish_state(error);
+
+            bool no_flow  = error & 0x01;
+            bool low_salt = error & 0x02;
+            bool high_salt = error & 0x04;
+            bool clean_cell = error & 0x90;
+
+            id(chlor_error_no_flow).publish_state(no_flow);
+            id(chlor_error_low_salt).publish_state(low_salt);
+            id(chlor_error_high_salt).publish_state(high_salt);
+            id(chlor_error_clean_cell).publish_state(clean_cell);
+
+            std::string errtxt = "OK";
+            if (error != 0x00) {
+              errtxt.clear();
+              if (no_flow) errtxt += "No Flow ";
+              if (low_salt) errtxt += "Low Salt ";
+              if (high_salt) errtxt += "High Salt ";
+              if (clean_cell) errtxt += "Clean Cell ";
+              if (errtxt.empty()) errtxt = "Unknown";
+            }
+            id(chlor_error_text).publish_state(errtxt.c_str());
+
+            ESP_LOGI("chlor", "SALT: %.0f ppm, ERR=0x%02X (%s)", ppm, error, errtxt.c_str());
+          }
+  - interval: 30s
+    then:
+      - lambda: |-
+          auto now = id(pool_time).now();
+          if (!now.is_valid()) return;
+          int current = now.hour*3600 + now.minute*60 + now.second;
+
+          // Parse scheduled times
+          int pool1_h, pool1_m, pool1_s;
+          if (sscanf(id(pool_1).state.c_str(), "%d:%d:%d", &pool1_h, &pool1_m, &pool1_s) != 3)
+            pool1_h = pool1_m = pool1_s = 0;
+          int pool1_time = pool1_h*3600 + pool1_m*60 + pool1_s;
+
+          int pool2_h, pool2_m, pool2_s;
+          if (sscanf(id(pool_2).state.c_str(), "%d:%d:%d", &pool2_h, &pool2_m, &pool2_s) != 3)
+            pool2_h = pool2_m = pool2_s = 0;
+          int pool2_time = pool2_h*3600 + pool2_m*60 + pool2_s;
+
+          int pool3_h, pool3_m, pool3_s;
+          if (sscanf(id(pool_3).state.c_str(), "%d:%d:%d", &pool3_h, &pool3_m, &pool3_s) != 3)
+            pool3_h = pool3_m = pool3_s = 0;
+          int pool3_time = pool3_h*3600 + pool3_m*60 + pool3_s;
+
+          // Numeric speeds
+          int speed1 = id(pool_1_speed_numeric).state;
+          int speed2 = id(pool_2_speed_numeric).state;
+          int speed3 = id(pool_3_speed_numeric).state;
+
+          struct Schedule { int time_sec; int speed; };
+          Schedule schedules[3] = {
+            { pool1_time, speed1 },
+            { pool2_time, speed2 },
+            { pool3_time, speed3 }
+          };
+
+          // Loop through schedules
+          for (auto &s : schedules) {
+            if (abs(current - s.time_sec) < 30) {  // within 30s of schedule
+              
+              if (id(heater_run) == "Heat") {
+                // Heater is running: store scheduled speed for later
+                if (s.speed == 0) id(Prev_Pump_Status) = "Off";
+                else if (s.speed == 1) id(Prev_Pump_Status) = "Low";
+                else if (s.speed == 2) id(Prev_Pump_Status) = "Medium";
+                else if (s.speed == 3) id(Prev_Pump_Status) = "High";
+                continue;  // skip applying buttons
+              }
+
+              // Apply scheduled speed if heater not running
+              if (s.speed == 0) id(b_off).press();
+              else if (s.speed == 1) id(b_low).press();
+              else if (s.speed == 3) id(b_high).press();
+            }
+          }
+
+binary_sensor:
+  - platform: template
+    name: "No Flow"
+    id: chlor_error_no_flow
+  - platform: template
+    name: "Low Salt"
+    id: chlor_error_low_salt
+  - platform: template
+    name: "High Salt"
+    id: chlor_error_high_salt
+  - platform: template
+    name: "Clean Cell"
+    id: chlor_error_clean_cell 
+
+
+sensor:
+  - platform: ads1115
+    multiplexer: 'A2_GND'
+    gain: 2.048
+    name: "5v rail"
+    filters:
+     - multiply: !lambda return 3;  
+  - platform: ads1115
+    multiplexer: 'A3_GND'
+    gain: 4.096
+    name: "12v rail"
+    filters:
+     - multiply: !lambda return 5;  
+  - platform: dallas_temp
+    address: 0x64406c0087ca0528
+    one_wire_id: bus1
+    id: temp_in
+    update_interval: 5s
+    on_value:
+      - lvgl.label.update:
+          id: l_water_temp
+          text: !lambda |-
+            char buf[32];
+            snprintf(buf, sizeof(buf), "Water: %.1f°F", id(d_temp_in).state);
+            return std::string(buf);
+  - platform: dallas_temp
+    address: 0x7914d40087856c28
+    one_wire_id: bus1
+    id: temp_out
+    update_interval: 10s
+  - platform: dallas_temp
+    address: 0x6a385c00874f0528
+    one_wire_id: bus1
+    id: ambient
+    update_interval: 10s  
+    on_value:
+      - lvgl.label.update:
+          id: l_a_temp
+          text: !lambda |-
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%.1f°F", id(d_ambient).state);
+            return std::string(buf);
+  # Templates
+  - platform: template
+    name: "Temperature In"
+    id: d_temp_in
+    unit_of_measurement: "°F"
+    accuracy_decimals: 0
+    lambda: |-
+      return round((id(temp_in).state) * (9.0 / 5.0) + 32.0);
+    update_interval: 5s
+  - platform: template
+    name: "Temperature Out"
+    id: d_temp_out
+    unit_of_measurement: "°F"
+    accuracy_decimals: 0
+    lambda: |-
+      return round((id(temp_out).state) * (9.0 / 5.0) + 32.0);
+    update_interval: 10s
+  - platform: template
+    name: "Ambient Temp"
+    id: d_ambient
+    unit_of_measurement: "°F"
+    accuracy_decimals: 0
+    lambda: |-
+      return round((id(ambient).state) * (9.0 / 5.0) + 32.0);
+    update_interval: 10s
+  - platform: template
+    name: "Heater Set Point"
+    id: d_heat_temp
+    unit_of_measurement: "°F"
+    accuracy_decimals: 0
+    lambda: |-
+      return round((id(pool_heater).target_temperature) * (9.0/5.0) + 32.0);
+    update_interval: 2s
+    on_value:
+      - lvgl.label.update:
+          id: l_set_temp
+          text: !lambda |-
+            char buf[32];
+            snprintf(buf, sizeof(buf), "Set: %.1f°F", id(d_heat_temp).state);
+            return std::string(buf);
+  - platform: template
+    name: "Pool 1 Speed Numeric"
+    id: pool_1_speed_numeric
+    lambda: |-
+      if (id(pool_1_speed).state == "Off") return 0;
+      if (id(pool_1_speed).state == "Low") return 1;
+      if (id(pool_1_speed).state == "Medium") return 2;
+      if (id(pool_1_speed).state == "High") return 3;
+      return 0;
+    update_interval: 1s
+  - platform: template
+    name: "Pool 2 Speed Numeric"
+    id: pool_2_speed_numeric
+    lambda: |-
+      if (id(pool_2_speed).state == "Off") return 0;
+      if (id(pool_2_speed).state == "Low") return 1;
+      if (id(pool_2_speed).state == "Medium") return 2;
+      if (id(pool_2_speed).state == "High") return 3;
+      return 0;
+    update_interval: 1s
+  - platform: template
+    name: "Pool 3 Speed Numeric"
+    id: pool_3_speed_numeric
+    lambda: |-
+      if (id(pool_3_speed).state == "Off") return 0;
+      if (id(pool_3_speed).state == "Low") return 1;
+      if (id(pool_3_speed).state == "Medium") return 2;
+      if (id(pool_3_speed).state == "High") return 3;
+      return 0;
+    update_interval: 1s
+  - platform: template
+    name: "Chlorinator Salt PPM"
+    id: salt_ppm
+    unit_of_measurement: "ppm"
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    name: "Chlorinator Status Code"
+    id: chlor_status
+    accuracy_decimals: 0
+    update_interval: never
+  
+  - platform: template
+    name: "Super Chlorinate Remaining (min)"
+    id: super_chlor_remaining_sensor
+    unit_of_measurement: "min"
+    update_interval: 60s
+    lambda: |-
+      return id(super_chlor_remaining) / 60.0;
+
+  - platform: template
+    name: "Chlorinator Output %"
+    id: chlor_output_actual
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+
+  - platform: template
+    name: "Chlorinator Error Code"
+    id: chlor_error_code
+    accuracy_decimals: 0
+
+  - platform: template
+    name: "Chlorinator Current Output %"
+    id: chlor_output_percent
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    icon: mdi:percent
+
+  - platform: ads1115
+    multiplexer: 'A0_GND'
+    gain: 2.048
+    name: "pH Voltage"
+    id: ph_voltage
+    update_interval: 2s
+
+  - platform: template
+    name: "pH Value"
+    unit_of_measurement: "pH"
+    icon: "mdi:flask-outline"
+    update_interval: 2s
+    lambda: |-
+      // Get voltage from ads1115 sensor
+      float V = id(ph_voltage).state;
+      // Apply calibration formula
+      return (-5.654 * V) + 15.509;  
+    
+    
+one_wire:
+  - platform: gpio
+    pin: GPIO04
+    id: bus1
+
+
+
+# Individual outputs
+switch:
+  - platform: gpio
+    pin:
+      xl9535: relays
+      number: 0
+      mode:
+        output: true
+      inverted: false 
+    id: speed_low
+    interlock: &interlock_group [speed_low, speed_high] 
+    interlock_wait_time: 1s
+  - platform: gpio
+    pin: 
+      xl9535: relays
+      number: 1
+      mode:
+        output: true
+      inverted: false 
+    id: speed_med
+    interlock: *interlock_group
+    interlock_wait_time: 1s
+  - platform: gpio
+    pin: 
+      xl9535: relays
+      number: 2
+      mode:
+        output: true
+      inverted: false 
+    id: speed_high
+    interlock: *interlock_group
+    interlock_wait_time: 1s
+  - platform: gpio
+    pin: 
+      xl9535: relays
+      number: 3
+      mode:
+        output: true
+      inverted: false 
+    id: relay_4 
+  - platform: gpio
+    pin: 
+      xl9535: relays
+      number: 4
+      mode:
+        output: true
+      inverted: false 
+    id: dose       
+  - platform: gpio
+    pin: 
+      xl9535: relays
+      number: 5
+      mode:
+        output: true
+      inverted: false 
+    id: relay_6       
+  - platform: gpio
+    pin: 
+      xl9535: relays
+      number: 6
+      mode:
+        output: true
+      inverted: false 
+    id: relay_7
+  - platform: template
+    name: "Super Chlorinate"
+    id: super_chlorinate
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          // Save the current output setting
+          static float last_output = 0.0f;
+          last_output = id(chlor_output_target).state;
+
+          // Send "Super Chlorinate" (101%)
+          uint8_t output = 101;
+          uint8_t packet[8];
+          packet[0] = 0x10;
+          packet[1] = 0x02;
+          packet[2] = 0x50;   // Destination: Chlorinator
+          packet[3] = 0x11;   // Command: Set Output %
+          packet[4] = output;
+          uint8_t checksum = (packet[0] + packet[1] + packet[2] + packet[3] + packet[4]) % 256;
+          packet[5] = checksum;
+          packet[6] = 0x10;
+          packet[7] = 0x03;
+
+          id(uart_bus).write_array(packet, sizeof(packet));
+          ESP_LOGI("chlor", "Super Chlorinate ON: Sent %% = %d (checksum=0x%02X)", output, checksum);
+
+          // --- Wait briefly for response ---
+          std::vector<uint8_t> rx;
+          uint8_t b;
+          uint32_t start = millis();
+          while (millis() - start < 400) {
+            if (id(uart_bus).available() && id(uart_bus).read_byte(&b)) {
+              rx.push_back(b);
+              ESP_LOGD("chlor", "[SuperChlor] RX byte: 0x%02X", b);
+            } else {
+              delay(3);
+            }
+          }
+
+          if (rx.size() >= 9) {
+            ESP_LOGI("chlor", "[SuperChlor] RX (%d bytes): %s", rx.size(), format_hex_pretty(rx).c_str());
+            uint8_t cmd = rx[3];
+            if (cmd == 0x18) {
+              uint8_t salt_raw = rx[4];
+              float ppm = salt_raw * 50.0f;
+              ESP_LOGI("chlor", "[SuperChlor] ACK: Salt %.0f ppm (raw=0x%02X)", ppm, salt_raw);
+            } else {
+              ESP_LOGI("chlor", "[SuperChlor] Response CMD=0x%02X", cmd);
+            }
+          } else {
+            ESP_LOGW("chlor", "[SuperChlor] No response received");
+          }
+      - sensor.template.publish:
+          id: super_chlor_remaining_sensor
+          state: !lambda 'return id(super_chlor_remaining) / 60.0;'    
+      - delay: 21600s
+      - switch.turn_off: super_chlorinate    
+
+    turn_off_action:
+      - lambda: |-
+          id(super_chlor_remaining) = 0;
+          id(super_chlor_remaining_sensor).publish_state(0);
+          // Restore the last slider setting
+          uint8_t output = (uint8_t)id(chlor_output_target).state;
+          uint8_t packet[8];
+          packet[0] = 0x10;
+          packet[1] = 0x02;
+          packet[2] = 0x50;
+          packet[3] = 0x11;
+          packet[4] = output;
+          uint8_t checksum = (packet[0] + packet[1] + packet[2] + packet[3] + packet[4]) % 256;
+          packet[5] = checksum;
+          packet[6] = 0x10;
+          packet[7] = 0x03;
+
+          id(uart_bus).write_array(packet, sizeof(packet));
+          ESP_LOGI("chlor", "Super Chlorinate OFF: Restored %% = %d (checksum=0x%02X)", output, checksum);
+
+          // Wait for ACK
+          std::vector<uint8_t> rx;
+          uint8_t b;
+          uint32_t start = millis();
+          while (millis() - start < 400) {
+            if (id(uart_bus).available() && id(uart_bus).read_byte(&b)) rx.push_back(b);
+            else delay(3);
+          }
+
+          if (rx.size() >= 9) {
+            ESP_LOGI("chlor", "[Restore] RX (%d bytes): %s", rx.size(), format_hex_pretty(rx).c_str());
+          } else {
+            ESP_LOGW("chlor", "[Restore] No ACK received");
+          }                                 
+
+
+# --- SPI Buses ---
+spi:
+  - id: tft
+    clk_pin: 14
+    mosi_pin: 13
+    miso_pin: 12
+  - id: spi_touch
+    clk_pin: 25
+    mosi_pin: 32
+    miso_pin: 39
+
+# --- Backlight ---
+output:
+  - platform: ledc
+    pin: 21
+    id: backlight_pwm
+    frequency: 1000 Hz
+    inverted: false
+
+light:
+# LCD backlight
+  - platform: monochromatic
+    output: backlight_pwm
+    name: "Display Backlight"
+    id: backlight
+    restore_mode: ALWAYS_ON
+
+display:
+  - platform: ili9xxx
+    color_palette: 8BIT               # Lower memory usage
+    model: st7796               # Display driver model
+    spi_id: tft
+    cs_pin: 
+      number: GPIO15
+      ignore_strapping_warning: true
+    dc_pin:
+      number: GPIO2
+      ignore_strapping_warning: true
+    invert_colors: false
+    color_order: RGB
+    transform:
+      swap_xy: false                  # Orient screen properly
+      mirror_x: false                  # if your top row is on the bottom, comment this line out or swtich to false
+    dimensions:
+      width: 240
+      height: 320
+    auto_clear_enabled: false
+    
+globals:
+  - id: heater_run
+    type: std::string
+    initial_value: '"Idle"'
+  - id: heater_on
+    type: std::string
+    initial_value: '"Off"'  
+  - id: Pump_Status
+    type: std::string
+    initial_value: '"Low"'
+  - id: Prev_Pump_Status
+    type: std::string
+    initial_value: '"Low"'
+  - id: Manual_Override
+    type: bool
+    initial_value: 'false'
+  - id: super_chlor_remaining
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: recent_touch
+    type: bool
+    restore_value: no
+    initial_value: "true"
+
+
+
+font:
+  - file: "gfonts://Roboto"
+    id: font1
+    size: 20
+  - file: "gfonts://Roboto"
+    id: font2
+    size: 20
+
+
+# --- Touchscreen ---
+touchscreen:
+  - platform: xpt2046
+    spi_id: spi_touch
+    cs_pin: 33
+    interrupt_pin: 36
+    update_interval: 300ms
+    id: touch
+    threshold: 250
+    calibration:
+      x_min: 230
+      x_max: 3800
+      y_min: 400
+      y_max: 3800
+    transform:
+      swap_xy: false
+      mirror_x: true
+    on_touch:
+      then:
+      - light.turn_on: backlight
+      - lambda: |-
+          id(recent_touch) = true;  
+    
+
+button:
+  - platform: template
+    name: "Pump Off"
+    id: b_off
+    on_press:
+      then:
+        - climate.control:
+            id: pool_heater
+            mode: "OFF"
+        - switch.turn_off: speed_low
+        - switch.turn_off: speed_high
+        - globals.set:
+            id: Pump_Status
+            value: '"Off"'
+        - globals.set:
+            id: Prev_Pump_Status
+            value: '"Off"'
+        - lambda: |-
+            id(Manual_Override) = true;
+        - lvgl.widget.update:
+            id: btn_off
+            bg_color: red
+        - lvgl.widget.update:
+            id: btn_low
+            bg_color: white
+        - lvgl.widget.update:
+            id: btn_high
+            bg_color: white    
+
+  - platform: template
+    name: "Pump Low"
+    id: b_low
+    on_press:
+      then:
+        - climate.control:
+            id: pool_heater
+            mode: "OFF"
+        - switch.turn_on: speed_low
+        - globals.set:
+            id: Pump_Status
+            value: '"Low"'
+        - globals.set:
+            id: Prev_Pump_Status
+            value: '"Low"'
+        - lambda: |-
+            id(Manual_Override) = true;
+        - lvgl.widget.update:
+            id: btn_off
+            bg_color: white
+        - lvgl.widget.update:
+            id: btn_low
+            bg_color: green
+        - lvgl.widget.update:
+            id: btn_high
+            bg_color: white
+
+  - platform: template
+    name: "Pump High"
+    id: b_high
+    on_press:
+      then:
+        - switch.turn_on: speed_high
+        - globals.set:
+            id: Pump_Status
+            value: '"High"'
+        - globals.set:
+            id: Prev_Pump_Status
+            value: '"High"'
+        - lambda: |-
+            id(Manual_Override) = true;
+        - lvgl.widget.update:
+            id: btn_off
+            bg_color: white
+        - lvgl.widget.update:
+            id: btn_low
+            bg_color: white
+        - lvgl.widget.update:
+            id: btn_high
+            bg_color: green
+
+
+climate:
+  - platform: thermostat
+    visual:
+      min_temperature: 50 °F
+      max_temperature: 100 °F
+      temperature_step: 1 °F
+    name: "Thermostat"
+    id: pool_heater
+    default_preset: start
+    on_boot_restore_from: DEFAULT_PRESET
+
+    on_state:
+      - lambda: |-
+          if (id(pool_heater).mode == CLIMATE_MODE_HEAT) {
+            id(heater_on) = "On";
+            if (id(heater_run) == "Idle") {
+            lv_label_set_text(id(l_heat_status), "Heater Idle");
+            } else {
+            
+            lv_label_set_text(id(l_heat_status), "🔥 Heating");
+          }
+          } else {
+            id(heater_on) = "Off";
+            id(relay_4).turn_off();
+            lv_label_set_text(id(l_heat_status), "Heater Off");
+          }
+    sensor: temp_in
+    min_heating_off_time: 3s
+    min_heating_run_time: 3s
+    min_idle_time: 3s
+
+    heat_action:
+      - lambda: |-
+          // Remember current pump state before forcing High
+          id(Prev_Pump_Status) = id(Pump_Status);
+      - globals.set:
+          id: heater_run
+          value: '"Heat"'
+      - globals.set:
+          id: Pump_Status
+          value: '"High"'
+      - button.press: b_high
+      - delay: 5s
+      - switch.turn_on: relay_4
+    idle_action:
+      - switch.turn_off: relay_4          # turn off heater relay
+      - delay: 5s
+      - lambda: |-
+          // Restore pump to previously scheduled state
+          if (id(Prev_Pump_Status) == "Low") {
+          id(b_low).press();
+          } else if (id(Prev_Pump_Status) == "High") {
+          id(b_high).press();
+          } else if (id(Prev_Pump_Status) == "Off") {
+          id(b_off).press();
+          }
+          id(heater_run) = "Idle";
+          ESP_LOGI("heater", "Idle - Pump restored to scheduled state: %s", id(Prev_Pump_Status).c_str());
+
+    heat_deadband: 2 °F
+    preset:
+      - name: start
+        default_target_temperature_low: 70 °F
+        mode: "Off"
+
+number:
+  - platform: template
+    name: "Chlorinator Output %"
+    id: chlor_output_target
+    min_value: 0
+    max_value: 100
+    step: 1
+    optimistic: true
+    on_value:
+      then:
+        - lambda: |-
+            uint8_t output = (uint8_t)x;  // value from HA
+
+            // --- Build packet ---
+            uint8_t packet[8];
+            packet[0] = 0x10;
+            packet[1] = 0x02;
+            packet[2] = 0x50;   // to chlorinator
+            packet[3] = 0x11;   // command = set output %
+            packet[4] = output; // % value
+            uint8_t checksum = (packet[0] + packet[1] + packet[2] + packet[3] + packet[4]) % 256;
+            packet[5] = checksum;
+            packet[6] = 0x10;
+            packet[7] = 0x03;
+
+            // --- Send ---
+            id(uart_bus).write_array(packet, sizeof(packet));
+            ESP_LOGI("chlor", "Sent Set Output %% = %d (checksum=0x%02X)", output, checksum);
+
+            // --- Read reply (if any) ---
+            std::vector<uint8_t> rx;
+            uint32_t start = millis();
+            while (millis() - start < 500) {
+              if (id(uart_bus).available()) {
+                uint8_t b;
+                id(uart_bus).read_byte(&b);
+                rx.push_back(b);
+                ESP_LOGD("chlor", "RX byte: 0x%02X", b);
+              } else {
+                delay(5);
+              }
+            }
+
+            if (rx.size() >= 9) {
+              ESP_LOGI("chlor", "RX (%d bytes): %s", rx.size(), format_hex_pretty(rx).c_str());
+
+              // --- Decode ---
+              uint8_t cmd  = rx[3];   // should be 0x12 (status reply)
+              uint8_t salt = rx[4];   // salt ppm * 50
+              uint8_t err  = rx[5];   // error flags
+
+              float ppm = salt * 50.0f;
+              ESP_LOGI("chlor", "Reply: CMD=0x%02X  Salt=%u*50=%.0f ppm  Error=0x%02X", cmd, salt, ppm, err);
+
+              // --- Decode error bits ---
+              std::string err_str = "OK";
+              if (err & 0x01) err_str = "No Flow";
+              else if (err & 0x02) err_str = "Low Salt";
+              else if (err & 0x04) err_str = "High Salt";
+              else if (err & 0x90) err_str = "Clean Cell";
+
+              // --- Optionally publish ---
+              id(salt_ppm).publish_state(ppm);
+              id(chlor_status_text).publish_state(err_str.c_str());
+            } else {
+              ESP_LOGW("chlor", "No valid reply to Set Output %% command");
+            }
+
+
+text_sensor:
+  - platform: homeassistant
+    id: pool_1
+    entity_id: input_datetime.pool_1
+  - platform: homeassistant
+    id: pool_2
+    entity_id: input_datetime.pool_2
+  - platform: homeassistant
+    id: pool_3
+    entity_id: input_datetime.pool_3
+  - platform: homeassistant
+    id: pool_1_speed
+    entity_id: input_select.pool_1_speed
+    name: "test"
+  - platform: homeassistant
+    id: pool_2_speed
+    entity_id: input_select.pool_2_speed
+  - platform: homeassistant
+    id: pool_3_speed
+    entity_id: input_select.pool_3_speed
+  - platform: template
+    name: HA Pump Status
+    lambda: |-
+      return { id(Pump_Status) };
+    update_interval: 1s
+  - platform: template
+    name: HA Desired Speed
+    lambda: |-
+      return { id(Prev_Pump_Status) };
+    update_interval: 1s
+  - platform: template
+    name: "Chlorinator Status Text"
+    id: chlor_status_text
+    update_interval: never
+  - platform: template
+    name: "Chlorinator Error Text"
+    id: chlor_error_text  
+  
+    
+
+
+
+color:
+  - id: room_bg_color
+    hex: "000000"
+  - id: default_button_bg_color
+    hex: "000000"
+  - id: default_button_pressed_bg_color
+    hex: "D3D3D3"
+  - id: red
+    hex: FF0000                    # Red
+  - id: btorange
+    hex: FF7F00                    # Orange
+  - id: yellow
+    hex: FFFF00                    # Yellow
+  - id: green
+    hex: 00FF00                    # Green
+  - id: pink
+    hex: FF1493                    # Pink
+  - id: btn_6_color
+    hex: "800080"                  # Purple
+  - id: blue
+    hex: 0000FF                    # Blue
+  - id: aqua
+    hex: 00FFFF                    # Aqua
+  - id: white
+    hex: "FFFFFF"                  # White
+  - id: black
+    hex: "000000"
+  - id: gray
+    hex: "C0C0C0"  
+
+
+lvgl:
+  buffer_size: 25%
+  style_definitions:
+    - id: header_footer
+      bg_color: 0x000000        # pure black (top of gradient)
+      bg_grad_color: 0x303030   # dark gray (bottom of gradient)
+      bg_grad_dir: VER
+      bg_opa: COVER
+      border_opa: TRANSP
+      radius: 0
+      pad_all: 0
+      pad_row: 0
+      pad_column: 0
+      border_color: 0x404040    # slightly lighter gray border (optional)
+      text_color: 0xFFFFFF      # white text
+      width: 100%
+      height: 30
+  theme:
+    button:
+      # This base is overridden by each button's bg_color
+      bg_color: 0x000000
+      bg_opa: COVER
+      border_color: 0x000000
+      border_width: 1
+      text_color: 0xFFFFFF  # overridden per label using text_color: btn_x_color
+      pressed:
+        # Light grey for pressed state (used uniformly)
+        bg_color: 0xC0C0C0
+        bg_grad_color: 0xC0C0C0
+        bg_opa: COVER
+      checked:
+        bg_color: 0x000000
+        bg_grad_color: 0x000000
+        bg_opa: COVER
+        text_color: 0x800080 # purple icon when "checked"... entity is on
+  top_layer:
+    scrollable: false   
+    widgets:
+      
+      - buttonmatrix:
+          align: bottom_mid
+          styles: header_footer
+          width: 320          # Match your screen width (or use lv_pct(100))
+          height: 40          # Controls vertical size
+          pad_all: 0
+          outline_width: 0
+          id: top_layer
+          items:
+            styles: header_footer
+          rows:
+            - buttons:
+              - id: page_prev
+                text: "\uF053"
+                on_press:
+                  then:
+                    lvgl.page.previous:
+              - id: page_home
+                text: "\uF015"
+                on_press:
+                  then:
+                    lvgl.page.show: main_page
+              - id: page_next
+                text: "\uF054"
+                on_press:
+                  then:
+                    lvgl.page.next:
+  pages:
+    - id: main_page
+      pad_all: 0
+      widgets:
+         - obj:
+            styles: header_footer
+            width: 240
+            height: 40
+            pad_all: 5px
+            outline_pad: 5px
+            scrollable: false   
+            widgets:
+              - label:
+                  align: center
+                  text: "PUMP & HEATER"
+              - label:
+                  id: l_a_temp
+                  text: ""    
+         - obj:
+            id: thermostat_box
+            width: 240
+            height: 160
+            x: 0
+            y: 40
+            pad_all: 6
+            radius: 12
+            bg_color: 0x202020
+            border_color: 0x404040
+            border_width: 2
+            shadow_width: 10
+            widgets:
+               - label:
+                    id: l_water_temp
+                    text: "Water: --°F"
+                    align: top_left
+                    y: 4
+                    text_color: 0x00A0FF
+                    text_font: montserrat_20
+
+               - label:
+                    id: l_set_temp
+                    text: "Set: --°F"
+                    align: center
+                    text_color: 0xFFFFFF
+                    text_font: montserrat_28
+               - button:
+                    id: btn_set_temp
+                    width: 100
+                    height: 40
+                    align: center
+                    bg_opa: TRANSP
+                    border_opa: TRANSP
+                    outline_opa: TRANSP
+                    border_width: 0
+                    outline_width: 0
+                    shadow_width: 0
+                    radius: 0
+                    on_click:
+                       - lambda: !lambda |-
+                            if (id(pool_heater).mode == CLIMATE_MODE_HEAT) {
+                            id(pool_heater).mode = CLIMATE_MODE_OFF;
+                            } else {
+                            id(pool_heater).mode = CLIMATE_MODE_HEAT;
+                            }
+                            id(pool_heater).publish_state();
+
+               - label:
+                    id: l_heat_status
+                    text: "Status: --"
+                    align: bottom_left
+                    y: -4
+                    text_font: montserrat_20
+                    text_color: 0xFFFFFF
+
+               - button:
+                    id: btn_up
+                    width: 60
+                    height: 40
+                    align: top_right
+                    radius: 10
+                    bg_color: 0x0066FF
+                    shadow_width: 6
+                    on_click:
+                       - lambda: |-
+                            id(pool_heater).target_temperature += .55;
+                    widgets:
+                       - label:
+                            text: "\uf077"
+                            align: CENTER
+                            text_font: montserrat_32
+
+               - button:
+                    id: btn_down
+                    width: 60
+                    height: 40
+                    align: bottom_right
+                    radius: 10
+                    bg_color: 0x0066FF
+                    shadow_width: 6
+                    on_click:
+                       - lambda: |-
+                            id(pool_heater).target_temperature -= .55;
+                    widgets:
+                       - label:
+                            text: "\uf078"
+                            align: CENTER
+                            text_font: montserrat_32
+         - obj:
+            width: 240
+            height: 80
+            bg_color: 0x202020
+            border_color: 0x404040
+            x: 0
+            y: 200
+            layout:
+              type: grid
+              grid_columns: [fr(1), fr(1), fr(1)]
+              grid_rows: [fr(1)]
+            pad_all: 5px
+            outline_pad: 5px
+            widgets:
+              - button:
+                  id: btn_off
+                  grid_cell_column_pos: 0
+                  grid_cell_row_pos: 0
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: STRETCH
+                  bg_color: white
+                  pressed:
+                    bg_color: default_button_pressed_bg_color
+                  widgets:
+                    - label:
+                        id: lbl_btn_off
+                        text: "OFF"
+                        text_font: font1
+                        text_color: black
+                        align: center
+                  on_click:
+                    - button.press: b_off
+                          
+              - button:
+                  id: btn_low
+                  grid_cell_column_pos: 1
+                  grid_cell_row_pos: 0
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: STRETCH
+                  bg_color: white
+                  pressed:
+                    bg_color: default_button_pressed_bg_color
+                  widgets:
+                    - label:
+                        id: lbl_btn_low
+                        text: "LOW"
+                        text_font: font1
+                        text_color: black
+                        align: center
+                  on_click:
+                    - button.press: b_low
+              - button:
+                  id: btn_high
+                  grid_cell_column_pos: 2
+                  grid_cell_row_pos: 0
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: STRETCH
+                  bg_color: white
+                  pressed:
+                    bg_color: default_button_pressed_bg_color
+                  widgets:
+                    - label:
+                        id: lbl_btn_high
+                        text: "HIGH"
+                        text_font: font1
+                        text_color: black
+                        align: center
+                  on_click:
+                    - button.press: b_high
+              
